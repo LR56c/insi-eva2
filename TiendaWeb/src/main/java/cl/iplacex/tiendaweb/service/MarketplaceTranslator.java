@@ -1,110 +1,187 @@
 package cl.iplacex.tiendaweb.service;
 
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
+import cl.iplacex.tiendaweb.JmsConfig;
+import cl.iplacex.tiendaweb.domain.Orden;
+import cl.iplacex.tiendaweb.ext.carrito.domain.Direccion;
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import jakarta.jms.*;
+import org.springframework.stereotype.Service;
+
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
+import org.w3c.dom.NodeList;
 import org.xml.sax.InputSource;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.StringReader;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 
 @Service
-public class TraductorPedidos {
+public class MarketplaceTranslator {
 
-    private final JmsTemplate jmsTemplate;
-    private final Gson gson;
+    private final ConnectionFactory connectionFactory;
+    private final Gson gson = new Gson();
 
-    @Autowired
-    public TraductorPedidos(JmsTemplate jmsTemplate) {
-        this.jmsTemplate = jmsTemplate;
-        this.gson = new Gson();
+    private JMSContext context;
+    private JMSProducer producer;
+    private Destination targetDestination;
+
+    public MarketplaceTranslator(ConnectionFactory connectionFactory) {
+        this.connectionFactory = connectionFactory;
     }
 
-    /**
-     * Traductor Web: Convierte XML de la tienda al JSON Canónico.
-     * Escucha en el canal: web_pedidos
-     */
-    @JmsListener(destination = "web_pedidos")
-    public void traducirDesdeWeb(String xmlMessage) {
-        System.out.println("Recibido en web_pedidos (XML): " + xmlMessage);
+    @PostConstruct
+    public void init() {
         try {
-            // 1. Parsear el XML
-            Map<String, Object> pedidoCanonico = parsearXmlAMapa(xmlMessage);
-            
-            // 2. Enriquecer o normalizar datos si es necesario (ej: agregar origen)
-            pedidoCanonico.put("origen", "TIENDA_WEB");
-
-            // 3. Enviar al canal unificado
-            enviarAlCanalUnificado(pedidoCanonico);
-
+            this.context = connectionFactory.createContext();
+            this.targetDestination = context.createTopic(JmsConfig.COLA_PEDIDOS_CENTRAL);
+            this.producer = context.createProducer();
+            Destination mkpQueue = context.createQueue(JmsConfig.COLA_MKP_PEDIDOS);
+            JMSConsumer mkpConsumer = context.createConsumer(mkpQueue);
+            mkpConsumer.setMessageListener(this::onMessageMkp);
+            Destination webQueue = context.createQueue(JmsConfig.COLA_WEB_PEDIDOS);
+            JMSConsumer webConsumer = context.createConsumer(webQueue);
+            webConsumer.setMessageListener(this::onMessageWeb);
         } catch (Exception e) {
-            System.err.println("Error traduciendo mensaje Web: " + e.getMessage());
             e.printStackTrace();
         }
     }
 
-    /**
-     * Traductor Marketplace: Convierte JSON específico del marketplace al JSON Canónico.
-     * Escucha en el canal: mkp_pedidos
-     */
-    @JmsListener(destination = "mkp_pedidos")
-    public void traducirDesdeMarketplace(String jsonMessage) {
-        System.out.println("Recibido en mkp_pedidos (JSON): " + jsonMessage);
+    @PreDestroy
+    public void cleanup() {
+        if (context != null) context.close();
+    }
+
+    public void onMessageMkp(Message message) {
         try {
-            // 1. Parsear el JSON específico
-            Map<String, Object> pedidoMkp = gson.fromJson(jsonMessage, Map.class);
-            
-            // 2. Transformar al Modelo Canónico
-            // Aquí se realizaría el mapeo de campos si los nombres difieren.
-            // Por ejemplo, si el MKP usa "shippingCost" y el Canónico usa "costo_envio"
-            Map<String, Object> pedidoCanonico = new HashMap<>(pedidoMkp);
-            
-            if (pedidoCanonico.containsKey("shippingCost")) {
-                pedidoCanonico.put("costo_envio", pedidoCanonico.remove("shippingCost"));
+
+            String rawJson = ((TextMessage) message).getText();
+            System.out.println("Mensaje recibido de Marketplace: " + rawJson);
+
+            JsonObject root = JsonParser.parseString(rawJson).getAsJsonObject();
+            JsonObject client = root.getAsJsonObject("cliente");
+
+            double totalAmount = root.get("montoTotal").getAsDouble();
+            if (root.has("costoEnvio") && !root.get("costoEnvio").isJsonNull()) {
+                totalAmount += root.get("costoEnvio").getAsDouble();
             }
-            pedidoCanonico.put("origen", "MARKETPLACE");
 
-            // 3. Enviar al canal unificado
-            enviarAlCanalUnificado(pedidoCanonico);
+            Orden pedido = new Orden();
+            pedido.setOrigen("marketplace");
+            if (root.has("id")) {
+                pedido.setId(root.get("id").getAsString());
+            }
+            if (root.has("fecha")) {
+                pedido.setFecha(root.get("fecha").getAsString());
+            }
+            pedido.setRut(client.get("rut").getAsString());
+            pedido.setClientName(client.get("nombre").getAsString() + " " + client.get("apellido").getAsString());
+            pedido.setTotal(totalAmount);
 
-        } catch (Exception e) {
-            System.err.println("Error traduciendo mensaje Marketplace: " + e.getMessage());
+            if (root.has("direccion")) {
+                JsonObject dirJson = root.getAsJsonObject("direccion");
+                Direccion dir = new Direccion();
+                String calle = dirJson.has("calle") ? dirJson.get("calle").getAsString() : "";
+                String numero = dirJson.has("numero") ? dirJson.get("numero").getAsString() : "";
+                dir.setCalleYNumero((calle + " " + numero).trim());
+                if (dirJson.has("comuna")) dir.setComuna(dirJson.get("comuna").getAsString());
+                pedido.setDireccion(dir);
+            }
+
+            if (root.has("items")) {
+                List<Orden.Item> items = new ArrayList<>();
+                JsonArray itemsJson = root.getAsJsonArray("items");
+                for (JsonElement el : itemsJson) {
+                    JsonObject itemObj = el.getAsJsonObject();
+                    String prod = itemObj.has("producto") ? itemObj.get("producto").getAsString() : "";
+                    int cant = itemObj.has("cantidad") ? itemObj.get("cantidad").getAsInt() : 0;
+                    double prec = itemObj.has("precioUnitario") ? itemObj.get("precioUnitario").getAsDouble() : 0;
+                    items.add(new Orden.Item(prod, cant, prec));
+                }
+                pedido.setItems(items);
+            }
+
+            String jsonCanonico = gson.toJson(pedido);
+            System.out.println("Mensaje Canónico enviado: " + jsonCanonico);
+            producer.send(targetDestination, jsonCanonico);
+        } catch (JMSException e) {
+            e.printStackTrace();
         }
     }
 
-    private void enviarAlCanalUnificado(Map<String, Object> pedido) {
-        String jsonCanonico = gson.toJson(pedido);
-        jmsTemplate.convertAndSend("pedidos", jsonCanonico);
-        System.out.println("Mensaje traducido enviado al canal 'pedidos': " + jsonCanonico);
+    public void onMessageWeb(Message message) {
+        try {
+            String xmlWeb = ((TextMessage) message).getText();
+            System.out.println("Mensaje recibido de Web: " + xmlWeb);
+            Orden pedido = parsearXml(xmlWeb);
+            String jsonCanonico = gson.toJson(pedido);
+            System.out.println("Mensaje Canónico enviado: " + jsonCanonico);
+            producer.send(targetDestination, jsonCanonico);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
-    // Método auxiliar simple para parsear XML a Map (Simulación de transformación)
-    private Map<String, Object> parsearXmlAMapa(String xml) throws Exception {
-        Map<String, Object> map = new HashMap<>();
-        
+    private Orden parsearXml(String xml) throws Exception {
         DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
         DocumentBuilder builder = factory.newDocumentBuilder();
         Document doc = builder.parse(new InputSource(new StringReader(xml)));
-        
         Element root = doc.getDocumentElement();
         
-        // Ejemplo básico de extracción de campos del XML
-        // Asumiendo estructura <pedido><id>1</id><total>1000</total>...</pedido>
-        if (root.getElementsByTagName("id").getLength() > 0) {
-            map.put("id", root.getElementsByTagName("id").item(0).getTextContent());
+        Orden pedido = new Orden();
+        pedido.setOrigen("web");
+        pedido.setFecha(getTagValue("fecha", root));
+
+        Element comprador = (Element) root.getElementsByTagName("comprador").item(0);
+        String nombre = getTagValue("nombre", comprador) + " " + getTagValue("apellido", comprador);
+        pedido.setClientName(nombre.trim());
+        pedido.setRut(getTagValue("rut", comprador));
+
+        Element dirEl = (Element) root.getElementsByTagName("direccionDespacho").item(0);
+        if (dirEl != null) {
+            Direccion dir = new Direccion();
+            dir.setCalleYNumero(getTagValue("calleYNumero", dirEl));
+            dir.setComuna(getTagValue("comuna", dirEl));
+            pedido.setDireccion(dir);
         }
-        if (root.getElementsByTagName("total").getLength() > 0) {
-            map.put("total", root.getElementsByTagName("total").item(0).getTextContent());
+
+        double total = 0;
+        List<Orden.Item> itemsList = new ArrayList<>();
+        NodeList items = root.getElementsByTagName("item");
+        for (int i = 0; i < items.getLength(); i++) {
+            Element item = (Element) items.item(i);
+            Element producto = (Element) item.getElementsByTagName("producto").item(0);
+            
+            String nombreProd = getTagValue("nombre", producto);
+            String precioStr = getTagValue("precioLista", producto);
+            double precio = precioStr.isEmpty() ? 0 : Double.parseDouble(precioStr);
+            
+            String cantidadStr = getTagValue("cantidad", item);
+            int cantidad = cantidadStr.isEmpty() ? 0 : Integer.parseInt(cantidadStr);
+            
+            total += precio * cantidad;
+            itemsList.add(new Orden.Item(nombreProd, cantidad, precio));
         }
-        if (root.getElementsByTagName("cliente").getLength() > 0) {
-            map.put("cliente", root.getElementsByTagName("cliente").item(0).getTextContent());
+
+        pedido.setTotal(total);
+        pedido.setItems(itemsList);
+        return pedido;
+    }
+
+    private String getTagValue(String tag, Element element) {
+        if (element == null) return "";
+        NodeList nodeList = element.getElementsByTagName(tag);
+        if (nodeList.getLength() > 0) {
+            return nodeList.item(0).getTextContent();
         }
-        
-        return map;
+        return "";
     }
 }

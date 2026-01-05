@@ -1,48 +1,93 @@
 package cl.iplacex.tiendaweb.service;
 
+import cl.iplacex.tiendaweb.JmsConfig;
+import cl.iplacex.tiendaweb.domain.Orden;
 import com.google.gson.Gson;
-import org.springframework.jms.annotation.JmsListener;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import jakarta.jms.*;
 import org.springframework.stereotype.Service;
 
-import java.util.Map;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 
 @Service
-public class FacturacionAdapter {
+public class FacturacionAdapter implements MessageListener {
 
+    private final ConnectionFactory connectionFactory;
     private final Gson gson = new Gson();
+    private JMSContext context;
 
-    /**
-     * Adapter de Facturación: Escucha el canal central (pedidos) y consume el servicio SOAP legado.
-     */
-    @JmsListener(destination = "pedidos")
-    public void procesarFacturacion(String jsonMessage) {
-        System.out.println("FacturacionAdapter recibido: " + jsonMessage);
+
+    public FacturacionAdapter(ConnectionFactory connectionFactory) {
+        this.connectionFactory = connectionFactory;
+    }
+
+    @PostConstruct
+    public void init() {
         try {
-            // 1. Recibir mensaje en formato canónico (JSON)
-            Map<String, Object> pedido = gson.fromJson(jsonMessage, Map.class);
-
-            // 2. Extraer información necesaria
-            // Asumimos que el pedido tiene id, total, cliente, etc.
-            Object idPedido = pedido.get("id");
-            Object total = pedido.get("total");
-            Object cliente = pedido.get("cliente");
-
-            // 3. Consumir servicio web SOAP de Facturación
-            emitirFacturaSoap(idPedido, cliente, total);
-
+            this.context = connectionFactory.createContext();
+            JMSConsumer consumer = context.createConsumer(context.createQueue(JmsConfig.COLA_PEDIDOS_FACTURACION));
+            consumer.setMessageListener(this);
         } catch (Exception e) {
-            System.err.println("Error en FacturacionAdapter: " + e.getMessage());
             e.printStackTrace();
         }
     }
 
-    private void emitirFacturaSoap(Object idPedido, Object cliente, Object total) {
-        // Simulación de la llamada al servicio SOAP legado
-        System.out.println("--- INICIO LLAMADA SOAP FACTURACION ---");
-        System.out.println("Enviando XML a servicio de facturación...");
-        System.out.println("Cliente: " + cliente);
-        System.out.println("Monto: " + total);
-        System.out.println("Ref Pedido: " + idPedido);
-        System.out.println("--- FIN LLAMADA SOAP FACTURACION ---");
+    @PreDestroy
+    public void cleanup() {
+        if (context != null) context.close();
+    }
+
+    @Override
+    public void onMessage(Message message) {
+        try {
+            if (!(message instanceof TextMessage)) {
+                return;
+            }
+            String jsonMessage = ((TextMessage) message).getText();
+            System.out.println("Mensaje recibido en FacturacionAdapter: " + jsonMessage);
+
+            Orden pedido = gson.fromJson(jsonMessage, Orden.class);
+
+            enviarSoap(pedido);
+        } catch (JMSException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void enviarSoap(Orden pedido) {
+        try {
+            String soapBody = String.format(
+                    "<soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:exa=\"http://example.org/\">\n" +
+                    "   <soapenv:Header/>\n" +
+                    "   <soapenv:Body>\n" +
+                    "      <exa:generarBoleta>\n" +
+                    "         <cliente>%s</cliente>\n" +
+                    "         <rut>%s</rut>\n" +
+                    "         <total>%d</total>\n" +
+                    "      </exa:generarBoleta>\n" +
+                    "   </soapenv:Body>\n" +
+                    "</soapenv:Envelope>",
+                    pedido.getClientName(),
+                    pedido.getRut(),
+                    (long) pedido.getTotal()
+            );
+
+            HttpClient client = HttpClient.newHttpClient();
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://localhost:8090/soap/facturacion"))
+                    .header("Content-Type", "text/xml; charset=utf-8")
+                    .POST(HttpRequest.BodyPublishers.ofString(soapBody))
+                    .build();
+
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            System.out.println("Respuesta SOAP: " + response.body());
+        } catch (Exception e) {
+            System.err.println("Error al enviar solicitud SOAP: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
 }

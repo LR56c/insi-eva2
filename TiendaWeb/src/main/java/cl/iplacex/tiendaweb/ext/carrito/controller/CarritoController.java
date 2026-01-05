@@ -37,7 +37,7 @@ public class CarritoController {
         Carrito carrito = (Carrito) session.getAttribute("carrito");
         pedido.setItems(
                 carrito.getLineasPedido().stream()
-                        .map(lp -> (LineaPedidoImpl) lp)   // casteo explícito
+                        .map(lp -> (LineaPedidoImpl) lp)
                         .collect(Collectors.toList())
         );
         model.addAttribute("pedido", pedido);

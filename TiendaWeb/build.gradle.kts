@@ -31,6 +31,13 @@ dependencies {
 
     implementation("jakarta.xml.bind:jakarta.xml.bind-api:4.0.2")
     implementation("com.sun.xml.bind:jaxb-ri:4.0.5")
+
+
+	implementation("org.apache.activemq:artemis-jakarta-client:2.44.0")
+	implementation("org.apache.activemq:artemis-commons:2.44.0")
+	implementation("com.google.code.gson:gson:2.13.2")
+
+	implementation("org.springframework.boot:spring-boot-starter-artemis:4.0.1")
 }
 
 tasks.withType<Test> {
